@@ -1,1 +1,0 @@
-# go-containerd-sandbox-demo

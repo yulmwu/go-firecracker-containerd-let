@@ -1,0 +1,29 @@
+apiVersion: sandbox.demo/v1
+kind: Sandbox
+metadata:
+  name: sbx-manifest
+spec:
+  egress: false
+  ports:
+    - hostPort: 30080
+      containerPort: 8080
+      protocol: tcp
+  containers:
+    - name: web
+      image: busybox:latest
+      args: ["sh", "-c", "mkdir -p /tmp/www && echo sandbox-demo > /tmp/www/index.html && httpd -f -p 8080 -h /tmp/www"]
+      env: []
+      limits:
+        memoryBytes: 134217728
+        cpuQuota: 50000
+        cpuPeriod: 100000
+        pidsLimit: 128
+    - name: worker
+      image: busybox:latest
+      args: ["sleep", "3600"]
+      env: []
+      limits:
+        memoryBytes: 134217728
+        cpuQuota: 50000
+        cpuPeriod: 100000
+        pidsLimit: 128
