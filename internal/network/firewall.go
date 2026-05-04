@@ -1,7 +1,11 @@
 package network
 
 import (
+	"bufio"
 	"fmt"
+	"hash/fnv"
+	"net"
+	"os"
 	"slices"
 	"strings"
 
@@ -104,6 +108,15 @@ func ApplySandboxRules(ipt *iptables.IPTables, sandboxID, ip, bridgeCIDR, bridge
 	// Allow return traffic for already-established connections first.
 	_ = ipt.AppendUnique("filter", fwd, "-m", "conntrack", "--ctstate", "ESTABLISHED,RELATED", "-j", "ACCEPT")
 
+	// With egress enabled, allow DNS queries to configured resolvers before
+	// private-range deny rules so package installs/name resolution still work.
+	if egress {
+		for _, ns := range systemNameservers() {
+			_ = ipt.AppendUnique("filter", fwd, "-d", ns, "-p", "udp", "--dport", "53", "-j", "ACCEPT")
+			_ = ipt.AppendUnique("filter", fwd, "-d", ns, "-p", "tcp", "--dport", "53", "-j", "ACCEPT")
+		}
+	}
+
 	// Deny internal/reserved ranges to prevent lateral movement and host/local
 	// network reachability from sandbox workloads.
 	for _, cidr := range []string{
@@ -170,11 +183,11 @@ func insertFirst(ipt *iptables.IPTables, parent string, rule []string) error {
 }
 
 func shortID(id string) string {
-	if len(id) > 8 {
-		return id[:8]
-	}
-
-	return id
+	// Use deterministic hash-based suffix to avoid chain name collisions
+	// between sandbox IDs that share the same prefix.
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(id))
+	return fmt.Sprintf("%08x", h.Sum32())
 }
 
 func hasChain(ipt *iptables.IPTables, chain string) bool {
@@ -196,4 +209,49 @@ func containsChain(chains []string, target string) bool {
 	}
 
 	return false
+}
+
+func systemNameservers() []string {
+	path := "/etc/resolv.conf"
+	// systemd-resolved hosts often expose 127.0.0.53 in /etc/resolv.conf.
+	// Prefer the upstream resolver list to build reachable DNS allow-rules.
+	if st, err := os.Stat("/run/systemd/resolve/resolv.conf"); err == nil && !st.IsDir() {
+		path = "/run/systemd/resolve/resolv.conf"
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	var out []string
+	seen := map[string]struct{}{}
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		fields := strings.Fields(line)
+		if len(fields) < 2 || fields[0] != "nameserver" {
+			continue
+		}
+
+		ip := net.ParseIP(fields[1])
+		if ip == nil || ip.To4() == nil {
+			continue
+		}
+
+		s := ip.String() + "/32"
+		if _, ok := seen[s]; ok {
+			continue
+		}
+
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+
+	return out
 }

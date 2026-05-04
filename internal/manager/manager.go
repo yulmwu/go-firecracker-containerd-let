@@ -77,6 +77,12 @@ func New(ctx context.Context, cniConfPath string) (*Manager, error) {
 		return nil, err
 	}
 
+	// Bridge L2 traffic must hit iptables FORWARD for sandbox isolation rules
+	// to be effective across different sandbox IPs on the same bridge.
+	if err := network.EnsureBridgeNetfilter(); err != nil {
+		return nil, err
+	}
+
 	st, err := store.NewFileStore("/var/lib/sandbox-demo/state")
 	if err != nil {
 		return nil, err
@@ -325,23 +331,35 @@ func (m *Manager) createContainer(ctx context.Context, id, name, image string, a
 	}
 
 	snap := id + "-snapshot"
+	mounts := []specs.Mount{
+		{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"rw", "nosuid", "nodev", "size=64m"}},
+		{Destination: "/run", Type: "tmpfs", Source: "tmpfs", Options: []string{"rw", "nosuid", "nodev", "size=64m"}},
+		{Destination: "/var/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"rw", "nosuid", "nodev", "size=64m"}},
+		{Destination: "/var/cache", Type: "tmpfs", Source: "tmpfs", Options: []string{"rw", "nosuid", "nodev", "size=64m"}},
+		{Destination: "/var/log", Type: "tmpfs", Source: "tmpfs", Options: []string{"rw", "nosuid", "nodev", "size=32m"}},
+	}
+
+	// In systemd-resolved hosts, /etc/resolv.conf often points to 127.0.0.53
+	// (host-local stub) which is unreachable inside sandbox netns.
+	if resolvPath := containerResolvConfPath(); resolvPath != "" {
+		mounts = append(mounts, specs.Mount{
+			Destination: "/etc/resolv.conf",
+			Type:        "bind",
+			Source:      resolvPath,
+			Options:     []string{"rbind", "ro"},
+		})
+	}
+
 	specOpts := []oci.SpecOpts{
 		oci.WithImageConfig(img),
 		oci.WithNoNewPrivileges,
 		oci.WithCapabilities([]string{}),
-		oci.WithRootFSReadonly(),
 		oci.WithMaskedPaths([]string{"/proc/acpi", "/proc/kcore", "/proc/keys", "/proc/timer_list", "/sys/firmware"}),
 		oci.WithReadonlyPaths([]string{"/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"}),
 		oci.WithMemoryLimit(uint64(lim.MemoryBytes)),
 		oci.WithPidsLimit(lim.PidsLimit),
 		oci.WithCPUCFS(lim.CPUQuota, lim.CPUPeriod),
-		oci.WithMounts([]specs.Mount{
-			{Destination: "/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"rw", "nosuid", "nodev", "size=64m"}},
-			{Destination: "/run", Type: "tmpfs", Source: "tmpfs", Options: []string{"rw", "nosuid", "nodev", "size=64m"}},
-			{Destination: "/var/tmp", Type: "tmpfs", Source: "tmpfs", Options: []string{"rw", "nosuid", "nodev", "size=64m"}},
-			{Destination: "/var/cache", Type: "tmpfs", Source: "tmpfs", Options: []string{"rw", "nosuid", "nodev", "size=64m"}},
-			{Destination: "/var/log", Type: "tmpfs", Source: "tmpfs", Options: []string{"rw", "nosuid", "nodev", "size=32m"}},
-		}),
+		oci.WithMounts(mounts),
 	}
 
 	if len(args) > 0 {
@@ -392,6 +410,20 @@ func (m *Manager) createContainer(ctx context.Context, id, name, image string, a
 		Runtime:     m.runtimeProfile.RuntimeType,
 		TaskStatus:  "running",
 	}, nil
+}
+
+func containerResolvConfPath() string {
+	const upstream = "/run/systemd/resolve/resolv.conf"
+	if st, err := os.Stat(upstream); err == nil && !st.IsDir() {
+		return upstream
+	}
+
+	const fallback = "/etc/resolv.conf"
+	if st, err := os.Stat(fallback); err == nil && !st.IsDir() {
+		return fallback
+	}
+
+	return ""
 }
 
 func (m *Manager) stopAndDeleteContainer(ctx context.Context, id, snapshotKey string) error {

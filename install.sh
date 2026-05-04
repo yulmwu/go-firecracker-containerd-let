@@ -42,6 +42,14 @@ log "Restarting containerd"
 sudo systemctl enable --now containerd
 sudo systemctl restart containerd
 
+log "Enabling bridge netfilter (required for sandbox-to-sandbox isolation)"
+sudo modprobe br_netfilter
+cat <<'CONF' | sudo tee /etc/sysctl.d/99-sandbox-demo.conf >/dev/null
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+CONF
+sudo sysctl --system >/dev/null
+
 log "Writing CNI config"
 sudo mkdir -p "${CNI_CONF_DIR}" /var/lib/cni/sandbox-demo
 cat <<'JSON' | sudo tee "${CNI_CONF_FILE}" >/dev/null
