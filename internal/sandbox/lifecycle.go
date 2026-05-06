@@ -28,6 +28,7 @@ func (s *Service) CreateSandboxAsync(ctx context.Context, req model.CreateSandbo
 }
 
 func (s *Service) createSandbox(ctx context.Context, req model.CreateSandboxRequest, async bool) (*model.Sandbox, error) {
+	s.dbg("create request sandbox=%s async=%t containers=%d ports=%d egress=%t", req.ID, async, len(req.Containers), len(req.Ports), req.Egress)
 	opCtx, opCancel := context.WithTimeout(ctx, 90*time.Second)
 	defer opCancel()
 	ctx = opCtx
@@ -72,9 +73,11 @@ func (s *Service) createSandbox(ctx context.Context, req model.CreateSandboxRequ
 	if err := s.store.Save(sbx); err != nil {
 		return nil, err
 	}
+	s.dbg("state saved sandbox=%s phase=%s", sbx.ID, sbx.Phase)
 
 	if async {
 		// Provision in background; caller can poll via GET/LIST.
+		s.dbg("start async provisioning sandbox=%s", req.ID)
 		go s.provisionSandbox(req.ID, req)
 		return sbx, nil
 	}
@@ -83,6 +86,7 @@ func (s *Service) createSandbox(ctx context.Context, req model.CreateSandboxRequ
 }
 
 func (s *Service) provisionSandbox(sandboxID string, req model.CreateSandboxRequest) {
+	s.dbg("provision begin sandbox=%s", sandboxID)
 	bgCtx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 	bgCtx = namespaces.WithNamespace(bgCtx, s.namespace)
@@ -100,8 +104,11 @@ func (s *Service) provisionSandbox(sandboxID string, req model.CreateSandboxRequ
 	}
 
 	if _, err := s.provisionSandboxSync(bgCtx, sbx, req); err != nil {
+		s.dbg("provision failed sandbox=%s err=%v", sandboxID, err)
 		s.markSandboxError(sandboxID, err)
+		return
 	}
+	s.dbg("provision done sandbox=%s", sandboxID)
 }
 
 func (s *Service) provisionSandboxSync(ctx context.Context, sbx *model.Sandbox, req model.CreateSandboxRequest) (*model.Sandbox, error) {
@@ -123,11 +130,13 @@ func (s *Service) provisionSandboxSync(ctx context.Context, sbx *model.Sandbox, 
 
 	vmCtx, vmCancel := context.WithTimeout(ctx, 40*time.Second)
 	defer vmCancel()
+	s.dbg("create vm sandbox=%s", sbx.ID)
 	if err := s.createVM(vmCtx, sbx.ID, len(req.Containers)); err != nil {
 		return nil, err
 	}
 
 	for _, c := range req.Containers {
+		s.dbg("create container sandbox=%s name=%s image=%s", sbx.ID, c.Name, c.Image)
 		ctrCtx, ctrCancel := context.WithTimeout(ctx, 25*time.Second)
 		st, err := s.createContainer(ctrCtx, sbx.ID+"-"+c.Name, c.Name, c.Image, c.Args, c.Env, c.WorkDir, withDefaultLimits(c.Limits), sbx.ID)
 		ctrCancel()
@@ -147,18 +156,23 @@ func (s *Service) provisionSandboxSync(ctx context.Context, sbx *model.Sandbox, 
 	}
 
 	sbx.IP = ip
+	s.dbg("resolved ip sandbox=%s ip=%s", sbx.ID, sbx.IP)
 	if err := s.applySandboxNetworkPolicy(sbx); err != nil {
 		return nil, err
 	}
+	s.dbg("network policy applied sandbox=%s", sbx.ID)
 
 	readyCtx, readyCancel := context.WithTimeout(ctx, 18*time.Second)
 	defer readyCancel()
 	if err := s.waitSandboxReady(readyCtx, sbx); err != nil {
 		return nil, err
 	}
+
 	if err := s.applyHostPortPublish(sbx); err != nil {
 		return nil, err
 	}
+
+	s.dbg("hostport publish applied sandbox=%s", sbx.ID)
 	// Published TCP readiness is best-effort; runtime task readiness is the
 	// primary success signal. Some images open ports slightly after task start.
 	_ = s.waitPublishedTCPReady(sbx)
@@ -168,6 +182,7 @@ func (s *Service) provisionSandboxSync(ctx context.Context, sbx *model.Sandbox, 
 	if err := s.store.Save(sbx); err != nil {
 		return nil, err
 	}
+	s.dbg("sandbox running saved sandbox=%s", sbx.ID)
 
 	created = true
 	return sbx, nil
@@ -186,6 +201,7 @@ func (s *Service) markSandboxError(sandboxID string, err error) {
 
 	setSandboxPhase(sbx, SandboxPhaseError, msg)
 	_ = s.store.Save(sbx)
+	s.dbg("sandbox error saved sandbox=%s err=%s", sandboxID, msg)
 }
 
 func (s *Service) DeleteSandbox(ctx context.Context, sandboxID string) error {

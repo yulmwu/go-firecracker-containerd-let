@@ -2,6 +2,7 @@ package sandbox
 
 import (
 	"context"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -38,6 +39,7 @@ type Config struct {
 	ReconcileInterval time.Duration
 	ReconcileGrace    time.Duration
 	ReconcileHits     int
+	Debug             bool
 }
 
 type Service struct {
@@ -73,6 +75,7 @@ func DefaultConfig() Config {
 		ReconcileInterval: DefaultReconcileEvery,
 		ReconcileGrace:    DefaultReconcileGrace,
 		ReconcileHits:     DefaultReconcileHits,
+		Debug:             strings.EqualFold(os.Getenv("SANDBOX_DEBUG"), "true") || os.Getenv("SANDBOX_DEBUG") == "1",
 	}
 }
 
@@ -121,6 +124,7 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		containerdAddr: cfg.ContainerdAddress,
 		lockDir:        cfg.LockDir,
 	}
+	network.SetDebugLogger(s.dbg)
 
 	if err := os.MkdirAll(s.lockDir, 0o755); err != nil {
 		_ = client.Close()
@@ -200,4 +204,12 @@ func csvEnv(key string, def []string) []string {
 	}
 
 	return out
+}
+
+func (s *Service) dbg(format string, args ...any) {
+	if !s.cfg.Debug {
+		return
+	}
+
+	log.Printf("[sandbox-debug] "+format, args...)
 }

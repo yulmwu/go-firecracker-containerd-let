@@ -19,6 +19,7 @@ var fcnetResultRe = regexp.MustCompile(`^fcnet-(.+)-veth0$`)
 
 // ReconcileOnce aligns state with runtime/network.
 func (s *Service) ReconcileOnce(ctx context.Context) error {
+	s.dbg("reconcile start")
 	ctx = namespaces.WithNamespace(ctx, s.namespace)
 	stateList, err := s.store.List()
 	if err != nil {
@@ -59,11 +60,13 @@ func (s *Service) ReconcileOnce(ctx context.Context) error {
 			// Prevent indefinite creating state if provisioning goroutine is stuck.
 			setSandboxPhase(sbx, SandboxPhaseError, "provisioning timeout")
 			_ = s.store.Save(sbx)
+			s.dbg("reconcile timeout -> error sandbox=%s", sbx.ID)
 			continue
 		}
 
 		if _, ok := runtimeSet[sbx.ID]; !ok {
 			if s.shouldFinalizeUnhealthy(sbx.ID) {
+				s.dbg("reconcile finalize missing runtime sandbox=%s", sbx.ID)
 				_ = s.deleteSandboxFromState(ctx, sbx)
 				s.clearUnhealthy(sbx.ID)
 			}
@@ -80,6 +83,7 @@ func (s *Service) ReconcileOnce(ctx context.Context) error {
 
 		if !healthy {
 			if s.shouldFinalizeUnhealthy(sbx.ID) {
+				s.dbg("reconcile finalize unhealthy sandbox=%s", sbx.ID)
 				_ = s.deleteSandboxFromState(ctx, sbx)
 				s.clearUnhealthy(sbx.ID)
 			}
@@ -98,6 +102,7 @@ func (s *Service) ReconcileOnce(ctx context.Context) error {
 			continue
 		}
 
+		s.dbg("reconcile cleanup orphan runtime sandbox=%s", runtimeID)
 		_ = s.cleanupOrphanRuntimeSandbox(ctx, runtimeID)
 	}
 
@@ -111,6 +116,7 @@ func (s *Service) ReconcileOnce(ctx context.Context) error {
 	}
 
 	network.DeleteOrphanHostPortDNAT(s.ipt, keep)
+	s.dbg("reconcile done state=%d runtime=%d", len(stateList), len(runtimeIDs))
 
 	return nil
 }

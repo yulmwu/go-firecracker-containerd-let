@@ -24,6 +24,7 @@ import (
 )
 
 func (s *Service) createVM(ctx context.Context, vmID string, containerCount int) error {
+	s.dbg("vm create call vm=%s container_count=%d", vmID, containerCount)
 	c, err := fcclient.New(s.containerdAddr + ".ttrpc")
 	if err != nil {
 		return err
@@ -36,10 +37,13 @@ func (s *Service) createVM(ctx context.Context, vmID string, containerCount int)
 	}
 
 	for attempt := 1; attempt <= 4; attempt++ {
+		s.dbg("vm create attempt vm=%s attempt=%d", vmID, attempt)
 		_, err = c.CreateVM(ctx, &proto.CreateVMRequest{VMID: vmID, ContainerCount: int32(containerCount), NetworkInterfaces: []*proto.FirecrackerNetworkInterface{{CNIConfig: &proto.CNIConfiguration{NetworkName: "fcnet", InterfaceName: "veth0", ConfDir: "/etc/cni/net.d", BinPath: []string{"/opt/cni/bin"}}}}})
 		if err == nil {
+			s.dbg("vm create success vm=%s", vmID)
 			return nil
 		}
+		s.dbg("vm create error vm=%s attempt=%d err=%v", vmID, attempt, err)
 
 		msg := strings.ToLower(err.Error())
 		if strings.Contains(msg, "already exists") {
@@ -59,6 +63,7 @@ func (s *Service) createVM(ctx context.Context, vmID string, containerCount int)
 }
 
 func (s *Service) stopVM(ctx context.Context, vmID string) error {
+	s.dbg("vm stop call vm=%s", vmID)
 	c, err := fcclient.New(s.containerdAddr + ".ttrpc")
 	if err != nil {
 		return err
@@ -80,6 +85,7 @@ func (s *Service) stopVM(ctx context.Context, vmID string) error {
 }
 
 func (s *Service) createContainer(ctx context.Context, id, name, image string, args, env []string, workDir string, lim model.ResourceLimits, vmID string) (model.ContainerState, error) {
+	s.dbg("container create call id=%s vm=%s image=%s", id, vmID, image)
 	ref := normalizeImage(image)
 	baseSpecOpts := []oci.SpecOpts{
 		oci.WithNoNewPrivileges,
@@ -109,6 +115,7 @@ func (s *Service) createContainer(ctx context.Context, id, name, image string, a
 
 	var lastErr error
 	for _, snapshotter := range s.snapshotterCandidates() {
+		s.dbg("container create snapshotter id=%s snapshotter=%s", id, snapshotter)
 		img, err := s.client.GetImage(ctx, ref)
 		if err != nil {
 			img, err = s.client.Pull(ctx, ref, containerd.WithPullSnapshotter(snapshotter))
@@ -135,6 +142,7 @@ func (s *Service) createContainer(ctx context.Context, id, name, image string, a
 
 		snap := id + "-snapshot"
 		for attempt := 1; attempt <= 4; attempt++ {
+			s.dbg("container create attempt id=%s snapshotter=%s attempt=%d", id, snapshotter, attempt)
 			_ = os.MkdirAll(filepath.Join("/run/firecracker-containerd/io.containerd.runtime.v2.task", s.namespace), 0o755)
 			ctr, err := s.client.NewContainer(ctx, id,
 				containerd.WithImage(img),
@@ -174,6 +182,7 @@ func (s *Service) createContainer(ctx context.Context, id, name, image string, a
 
 				return model.ContainerState{}, fmt.Errorf("start task %q: %w", id, err)
 			}
+			s.dbg("container create success id=%s pid=%d", id, task.Pid())
 
 			return model.ContainerState{ID: id, Name: name, Phase: ContainerPhaseRunning, Image: ref, Args: args, Env: env, SnapshotKey: snap, TaskPID: task.Pid(), Runtime: "aws.firecracker", TaskStatus: "running"}, nil
 		}
@@ -253,6 +262,7 @@ func (s *Service) deleteSandboxFromState(ctx context.Context, sbx *model.Sandbox
 }
 
 func (s *Service) deleteSandboxRuntimeArtifacts(ctx context.Context, sbx *model.Sandbox) error {
+	s.dbg("cleanup runtime artifacts sandbox=%s", sbx.ID)
 	var errs []error
 	for _, name := range sortedContainerNames(sbx.Containers) {
 		if e := s.stopAndDeleteContainer(ctx, sbx.Containers[name].ID); e != nil {
@@ -265,6 +275,7 @@ func (s *Service) deleteSandboxRuntimeArtifacts(ctx context.Context, sbx *model.
 	_ = s.cleanupShimArtifacts(sbx.ID)
 	_ = s.cleanupCNICache(sbx.ID)
 	_ = s.stopVM(ctx, sbx.ID)
+	s.dbg("cleanup runtime artifacts done sandbox=%s err_count=%d", sbx.ID, len(errs))
 
 	return errors.Join(errs...)
 }
@@ -322,14 +333,17 @@ func (s *Service) resolveSandboxIP(ctx context.Context, sandboxID string) (strin
 }
 
 func (s *Service) applySandboxNetworkPolicy(sbx *model.Sandbox) error {
+	s.dbg("apply sandbox firewall sandbox=%s ip=%s", sbx.ID, sbx.IP)
 	return network.ApplySandboxRules(s.ipt, sbx.ID, sbx.IP, s.cidr, s.bridgeIF, sbx.Egress, toPublishedPorts(sbx.Ports))
 }
 
 func (s *Service) applyHostPortPublish(sbx *model.Sandbox) error {
+	s.dbg("apply hostport dnat sandbox=%s ip=%s ports=%v", sbx.ID, sbx.IP, sbx.Ports)
 	return network.ApplyHostPortDNAT(s.ipt, sbx.ID, sbx.IP, toHostPortForwards(sbx.Ports))
 }
 
 func (s *Service) cleanupHostPortPublish(sbx *model.Sandbox) {
+	s.dbg("cleanup hostport dnat sandbox=%s ip=%s ports=%v", sbx.ID, sbx.IP, sbx.Ports)
 	if sbx.IP != "" {
 		network.DeleteHostPortDNAT(s.ipt, sbx.ID, sbx.IP, toHostPortForwards(sbx.Ports))
 	}
