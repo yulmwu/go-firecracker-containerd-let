@@ -1,6 +1,7 @@
 package httpserver
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"os"
@@ -25,13 +26,16 @@ func (s *Server) createSandbox(c *gin.Context) {
 		req.ID = "sbx-" + time.Now().UTC().Format("20060102-150405")
 	}
 
-	sbx, err := s.svc.CreateSandbox(c.Request.Context(), req)
+	opCtx, cancel := context.WithTimeout(c.Request.Context(), 10*time.Second)
+	defer cancel()
+
+	sbx, err := s.svc.CreateSandboxAsync(opCtx, req)
 	if err != nil {
 		respondError(c, http.StatusBadRequest, err)
 		return
 	}
 
-	respondJSON(c, http.StatusCreated, gin.H{"sandbox": sbx}, s.ipSvc.Lookup(c.Request.Context()))
+	respondJSON(c, http.StatusAccepted, gin.H{"sandbox": sbx}, s.ipSvc.Lookup(c.Request.Context()))
 }
 
 func (s *Server) getSandbox(c *gin.Context) {
@@ -60,7 +64,9 @@ func (s *Server) listSandboxes(c *gin.Context) {
 }
 
 func (s *Server) deleteSandbox(c *gin.Context) {
-	if err := s.svc.DeleteSandbox(c.Request.Context(), c.Param("id")); err != nil {
+	opCtx, cancel := context.WithTimeout(c.Request.Context(), 40*time.Second)
+	defer cancel()
+	if err := s.svc.DeleteSandbox(opCtx, c.Param("id")); err != nil {
 		respondError(c, http.StatusInternalServerError, err)
 		return
 	}
@@ -69,7 +75,9 @@ func (s *Server) deleteSandbox(c *gin.Context) {
 }
 
 func (s *Server) reconcile(c *gin.Context) {
-	if err := s.svc.ReconcileOnce(c.Request.Context()); err != nil {
+	opCtx, cancel := context.WithTimeout(c.Request.Context(), 45*time.Second)
+	defer cancel()
+	if err := s.svc.ReconcileOnce(opCtx); err != nil {
 		respondError(c, http.StatusInternalServerError, err)
 		return
 	}

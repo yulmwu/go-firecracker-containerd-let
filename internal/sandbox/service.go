@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"example.com/sandbox-demo/internal/network"
@@ -20,8 +21,11 @@ const (
 	DefaultBridgeInterface = "fc-br0"
 	DefaultSubnetCIDR      = "10.89.0.0/16"
 	DefaultCNIConfPath     = "/etc/cni/net.d/20-fcnet.conflist"
-	DefaultReadyTimeout    = 8 * time.Second
+	DefaultReadyTimeout    = 20 * time.Second
 	DefaultReconcileEvery  = 15 * time.Second
+	DefaultReconcileGrace  = 5 * time.Second
+	DefaultReconcileHits   = 2
+	DefaultLockWaitTimeout = 20 * time.Second
 )
 
 type Config struct {
@@ -32,12 +36,19 @@ type Config struct {
 	BridgeInterface   string
 	SubnetCIDR        string
 	ReconcileInterval time.Duration
+	ReconcileGrace    time.Duration
+	ReconcileHits     int
 }
 
 type Service struct {
 	client         *containerd.Client
 	ipt            *iptables.IPTables
 	store          *store.FileStore
+	portMu         sync.Mutex
+	reservedPorts  map[string]string
+	reconcileMu    sync.Mutex
+	unhealthySince map[string]time.Time
+	unhealthyHits  map[string]int
 	cfg            Config
 	namespace      string
 	bridgeIF       string
@@ -60,6 +71,8 @@ func DefaultConfig() Config {
 		BridgeInterface:   DefaultBridgeInterface,
 		SubnetCIDR:        DefaultSubnetCIDR,
 		ReconcileInterval: DefaultReconcileEvery,
+		ReconcileGrace:    DefaultReconcileGrace,
+		ReconcileHits:     DefaultReconcileHits,
 	}
 }
 
@@ -98,6 +111,9 @@ func New(ctx context.Context, cfg Config) (*Service, error) {
 		client:         client,
 		ipt:            ipt,
 		store:          st,
+		reservedPorts:  map[string]string{},
+		unhealthySince: map[string]time.Time{},
+		unhealthyHits:  map[string]int{},
 		cfg:            cfg,
 		namespace:      cfg.Namespace,
 		bridgeIF:       cfg.BridgeInterface,
@@ -143,6 +159,14 @@ func withConfigDefaults(cfg Config) Config {
 
 	if cfg.ReconcileInterval <= 0 {
 		cfg.ReconcileInterval = DefaultReconcileEvery
+	}
+
+	if cfg.ReconcileGrace <= 0 {
+		cfg.ReconcileGrace = DefaultReconcileGrace
+	}
+
+	if cfg.ReconcileHits < 1 {
+		cfg.ReconcileHits = DefaultReconcileHits
 	}
 
 	return cfg

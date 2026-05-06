@@ -41,11 +41,32 @@ func (s *Service) ReconcileOnce(ctx context.Context) error {
 	}
 
 	for _, sbx := range stateList {
+		if s.isSandboxLockHeld(sbx.ID) {
+			continue
+		}
+
+		if sbx.Phase == SandboxPhaseDeleting {
+			continue
+		}
+
+		if sbx.Phase == SandboxPhaseCreating && time.Since(sbx.CreatedAt) < 2*time.Minute {
+			// During initial provisioning window, avoid treating transient
+			// not-yet-created runtime/container state as unhealthy.
+			continue
+		}
+
+		if sbx.Phase == SandboxPhaseCreating && time.Since(sbx.CreatedAt) >= 2*time.Minute {
+			// Prevent indefinite creating state if provisioning goroutine is stuck.
+			setSandboxPhase(sbx, SandboxPhaseError, "provisioning timeout")
+			_ = s.store.Save(sbx)
+			continue
+		}
+
 		if _, ok := runtimeSet[sbx.ID]; !ok {
-			sbx.Phase = SandboxPhaseError
-			sbx.Error = "missing runtime resources"
-			sbx.UpdatedAt = time.Now().UTC()
-			_ = s.store.Delete(sbx.ID)
+			if s.shouldFinalizeUnhealthy(sbx.ID) {
+				_ = s.deleteSandboxFromState(ctx, sbx)
+				s.clearUnhealthy(sbx.ID)
+			}
 			continue
 		}
 
@@ -58,17 +79,38 @@ func (s *Service) ReconcileOnce(ctx context.Context) error {
 		}
 
 		if !healthy {
-			_ = s.deleteSandboxFromState(ctx, sbx)
+			if s.shouldFinalizeUnhealthy(sbx.ID) {
+				_ = s.deleteSandboxFromState(ctx, sbx)
+				s.clearUnhealthy(sbx.ID)
+			}
+			continue
 		}
+		s.clearUnhealthy(sbx.ID)
 	}
 
 	for _, runtimeID := range runtimeIDs {
 		if _, ok := stateMap[runtimeID]; ok {
 			continue
 		}
+		// Create/Delete holds an exclusive sandbox lock. If locked, skip orphan
+		// cleanup this round to avoid racing in-flight lifecycle operations.
+		if s.isSandboxLockHeld(runtimeID) {
+			continue
+		}
 
 		_ = s.cleanupOrphanRuntimeSandbox(ctx, runtimeID)
 	}
+
+	keep := map[string]struct{}{}
+	for _, sbx := range stateList {
+		keep[sbx.ID] = struct{}{}
+	}
+
+	for _, id := range runtimeIDs {
+		keep[id] = struct{}{}
+	}
+
+	network.DeleteOrphanHostPortDNAT(s.ipt, keep)
 
 	return nil
 }
@@ -172,6 +214,8 @@ func (s *Service) cleanupOrphanRuntimeSandbox(ctx context.Context, sandboxID str
 	}
 
 	if len(tmp.Containers) == 0 && tmp.IP == "" {
+		// Even without runtime/cni artifacts, DNAT rules may remain after partial failure.
+		s.cleanupHostPortPublish(tmp)
 		return nil
 	}
 
@@ -204,4 +248,30 @@ func (s *Service) isContainerRunning(ctx context.Context, id string) bool {
 	}
 
 	return string(status.Status) == "running"
+}
+
+func (s *Service) shouldFinalizeUnhealthy(sandboxID string) bool {
+	s.reconcileMu.Lock()
+	defer s.reconcileMu.Unlock()
+
+	now := time.Now()
+	if _, ok := s.unhealthySince[sandboxID]; !ok {
+		s.unhealthySince[sandboxID] = now
+		s.unhealthyHits[sandboxID] = 1
+		return false
+	}
+
+	s.unhealthyHits[sandboxID]++
+	if now.Sub(s.unhealthySince[sandboxID]) < s.cfg.ReconcileGrace {
+		return false
+	}
+
+	return s.unhealthyHits[sandboxID] >= s.cfg.ReconcileHits
+}
+
+func (s *Service) clearUnhealthy(sandboxID string) {
+	s.reconcileMu.Lock()
+	delete(s.unhealthySince, sandboxID)
+	delete(s.unhealthyHits, sandboxID)
+	s.reconcileMu.Unlock()
 }

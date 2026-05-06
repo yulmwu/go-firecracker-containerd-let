@@ -19,6 +19,17 @@ const (
 	ContainerPhaseUnknown  = "unknown"
 )
 
+func setSandboxPhase(sbx *model.Sandbox, phase, errMsg string) {
+	sbx.Phase = phase
+	if errMsg != "" {
+		sbx.Error = errMsg
+	} else if phase != SandboxPhaseError {
+		sbx.Error = ""
+	}
+
+	sbx.UpdatedAt = time.Now().UTC()
+}
+
 func (s *Service) newSandboxState(req model.CreateSandboxRequest) *model.Sandbox {
 	now := time.Now().UTC()
 	sbx := &model.Sandbox{
@@ -35,5 +46,17 @@ func (s *Service) newSandboxState(req model.CreateSandboxRequest) *model.Sandbox
 	}
 
 	sbx.Ports = append(sbx.Ports, req.Ports...)
+	for _, c := range req.Containers {
+		sbx.Containers[c.Name] = model.ContainerState{
+			ID:      sbx.ID + "-" + c.Name,
+			Name:    c.Name,
+			Phase:   ContainerPhaseCreating,
+			Image:   c.Image,
+			Args:    append([]string(nil), c.Args...),
+			Env:     append([]string(nil), c.Env...),
+			Runtime: "aws.firecracker",
+		}
+	}
+
 	return sbx
 }

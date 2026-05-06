@@ -35,16 +35,27 @@ func (s *Service) createVM(ctx context.Context, vmID string, containerCount int)
 		containerCount = 1
 	}
 
-	_, err = c.CreateVM(ctx, &proto.CreateVMRequest{VMID: vmID, ContainerCount: int32(containerCount), NetworkInterfaces: []*proto.FirecrackerNetworkInterface{{CNIConfig: &proto.CNIConfiguration{NetworkName: "fcnet", InterfaceName: "veth0", ConfDir: "/etc/cni/net.d", BinPath: []string{"/opt/cni/bin"}}}}})
-	if err != nil && strings.Contains(strings.ToLower(err.Error()), "already exists") {
-		return nil
+	for attempt := 1; attempt <= 4; attempt++ {
+		_, err = c.CreateVM(ctx, &proto.CreateVMRequest{VMID: vmID, ContainerCount: int32(containerCount), NetworkInterfaces: []*proto.FirecrackerNetworkInterface{{CNIConfig: &proto.CNIConfiguration{NetworkName: "fcnet", InterfaceName: "veth0", ConfDir: "/etc/cni/net.d", BinPath: []string{"/opt/cni/bin"}}}}})
+		if err == nil {
+			return nil
+		}
+
+		msg := strings.ToLower(err.Error())
+		if strings.Contains(msg, "already exists") {
+			return nil
+		}
+
+		if !strings.Contains(msg, "vsock") && !strings.Contains(msg, "dial unix firecracker.vsock") {
+			return fmt.Errorf("create vm %s: %w", vmID, err)
+		}
+
+		// Best-effort cleanup before retry to avoid stale half-created VM state.
+		_, _ = c.StopVM(ctx, &proto.StopVMRequest{VMID: vmID})
+		time.Sleep(time.Duration(150*attempt) * time.Millisecond)
 	}
 
-	if err != nil {
-		return fmt.Errorf("create vm %s: %w", vmID, err)
-	}
-
-	return nil
+	return fmt.Errorf("create vm %s: %w", vmID, err)
 }
 
 func (s *Service) stopVM(ctx context.Context, vmID string) error {
@@ -61,6 +72,7 @@ func (s *Service) stopVM(ctx context.Context, vmID string) error {
 		if strings.Contains(msg, "not found") || strings.Contains(msg, "does not exist") || strings.Contains(msg, "forcefully terminated") {
 			return nil
 		}
+
 		return fmt.Errorf("stop vm %s: %w", vmID, err)
 	}
 
@@ -72,6 +84,8 @@ func (s *Service) createContainer(ctx context.Context, id, name, image string, a
 	baseSpecOpts := []oci.SpecOpts{
 		oci.WithNoNewPrivileges,
 		seccomp.WithDefaultProfile(),
+		oci.WithHostHostsFile,
+		oci.WithHostResolvconf,
 		oci.WithMaskedPaths([]string{"/proc/acpi", "/proc/kcore", "/proc/keys", "/proc/timer_list", "/sys/firmware"}),
 		oci.WithReadonlyPaths([]string{"/proc/bus", "/proc/fs", "/proc/irq", "/proc/sys", "/proc/sysrq-trigger"}),
 		oci.WithMemoryLimit(uint64(lim.MemoryBytes)),
@@ -120,33 +134,49 @@ func (s *Service) createContainer(ctx context.Context, id, name, image string, a
 		specOpts := append([]oci.SpecOpts{oci.WithImageConfig(img)}, baseSpecOpts...)
 
 		snap := id + "-snapshot"
-		ctr, err := s.client.NewContainer(ctx, id,
-			containerd.WithImage(img),
-			containerd.WithSnapshotter(snapshotter),
-			containerd.WithNewSnapshot(snap, img),
-			containerd.WithRuntime("aws.firecracker", nil),
-			containerd.WithNewSpec(specOpts...),
-		)
+		for attempt := 1; attempt <= 4; attempt++ {
+			_ = os.MkdirAll(filepath.Join("/run/firecracker-containerd/io.containerd.runtime.v2.task", s.namespace), 0o755)
+			ctr, err := s.client.NewContainer(ctx, id,
+				containerd.WithImage(img),
+				containerd.WithSnapshotter(snapshotter),
+				containerd.WithNewSnapshot(snap, img),
+				containerd.WithRuntime("aws.firecracker", nil),
+				containerd.WithNewSpec(specOpts...),
+			)
 
-		if err != nil {
-			if isSnapshotterErr(err) {
-				lastErr = err
-				continue
+			if err != nil {
+				if isSnapshotterErr(err) {
+					lastErr = err
+					break
+				}
+
+				return model.ContainerState{}, fmt.Errorf("new container %q: %w", id, err)
 			}
 
-			return model.ContainerState{}, fmt.Errorf("new container %q: %w", id, err)
-		}
+			task, err := ctr.NewTask(ctx, cio.NewCreator(cio.WithStdio))
+			if err != nil {
+				_ = ctr.Delete(ctx)
+				if isTransientRuntimeErr(err) {
+					time.Sleep(time.Duration(120*attempt) * time.Millisecond)
+					continue
+				}
 
-		task, err := ctr.NewTask(ctx, cio.NewCreator(cio.WithStdio))
-		if err != nil {
-			return model.ContainerState{}, fmt.Errorf("new task %q: %w", id, err)
-		}
+				return model.ContainerState{}, fmt.Errorf("new task %q: %w", id, err)
+			}
 
-		if err := task.Start(ctx); err != nil {
-			return model.ContainerState{}, fmt.Errorf("start task %q: %w", id, err)
-		}
+			if err := task.Start(ctx); err != nil {
+				_, _ = task.Delete(ctx, containerd.WithProcessKill)
+				_ = ctr.Delete(ctx)
+				if isTransientRuntimeErr(err) {
+					time.Sleep(time.Duration(120*attempt) * time.Millisecond)
+					continue
+				}
 
-		return model.ContainerState{ID: id, Name: name, Phase: ContainerPhaseRunning, Image: ref, Args: args, Env: env, SnapshotKey: snap, TaskPID: task.Pid(), Runtime: "aws.firecracker", TaskStatus: "running"}, nil
+				return model.ContainerState{}, fmt.Errorf("start task %q: %w", id, err)
+			}
+
+			return model.ContainerState{ID: id, Name: name, Phase: ContainerPhaseRunning, Image: ref, Args: args, Env: env, SnapshotKey: snap, TaskPID: task.Pid(), Runtime: "aws.firecracker", TaskStatus: "running"}, nil
+		}
 	}
 
 	if lastErr != nil {
@@ -154,6 +184,14 @@ func (s *Service) createContainer(ctx context.Context, id, name, image string, a
 	}
 
 	return model.ContainerState{}, fmt.Errorf("no usable snapshotter for %q", ref)
+}
+
+func isTransientRuntimeErr(err error) bool {
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "vsock") ||
+		strings.Contains(msg, "cannot start a container that has stopped") ||
+		strings.Contains(msg, "failed to dial") ||
+		strings.Contains(msg, "connection refused")
 }
 
 func (s *Service) snapshotterCandidates() []string {
@@ -197,6 +235,11 @@ func (s *Service) stopAndDeleteContainer(ctx context.Context, id string) error {
 			return nil
 		}
 
+		// Firecracker/containerd can fail snapshot cleanup when snapshotter plugin
+		// is transiently unhealthy; keep-snapshot still removes container metadata.
+		if derr := ctr.Delete(ctx); derr == nil || strings.Contains(strings.ToLower(derr.Error()), "not found") {
+			return nil
+		}
 		return err
 	}
 
@@ -204,6 +247,12 @@ func (s *Service) stopAndDeleteContainer(ctx context.Context, id string) error {
 }
 
 func (s *Service) deleteSandboxFromState(ctx context.Context, sbx *model.Sandbox) error {
+	err := s.deleteSandboxRuntimeArtifacts(ctx, sbx)
+	_ = s.store.Delete(sbx.ID)
+	return err
+}
+
+func (s *Service) deleteSandboxRuntimeArtifacts(ctx context.Context, sbx *model.Sandbox) error {
 	var errs []error
 	for _, name := range sortedContainerNames(sbx.Containers) {
 		if e := s.stopAndDeleteContainer(ctx, sbx.Containers[name].ID); e != nil {
@@ -211,17 +260,51 @@ func (s *Service) deleteSandboxFromState(ctx context.Context, sbx *model.Sandbox
 		}
 	}
 
+	s.cleanupHostPortPublish(sbx)
 	s.cleanupSandboxNetworkPolicy(sbx)
-	_ = s.store.Delete(sbx.ID)
+	_ = s.cleanupShimArtifacts(sbx.ID)
+	_ = s.cleanupCNICache(sbx.ID)
 	_ = s.stopVM(ctx, sbx.ID)
 
 	return errors.Join(errs...)
 }
 
-func (s *Service) resolveSandboxIP(_ context.Context, sandboxID string) (string, error) {
+func (s *Service) cleanupShimArtifacts(sandboxID string) error {
+	_ = os.RemoveAll(filepath.Join("/var/lib/firecracker-containerd/shim-base", s.namespace+"#"+sandboxID))
+	base := filepath.Join("/run/firecracker-containerd/io.containerd.runtime.v2.task", s.namespace)
+	entries, err := os.ReadDir(base)
+	if err != nil {
+		return nil
+	}
+
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), sandboxID+"-") {
+			_ = os.RemoveAll(filepath.Join(base, e.Name()))
+		}
+	}
+
+	return nil
+}
+
+func (s *Service) cleanupCNICache(sandboxID string) error {
+	if sandboxID == "" {
+		return nil
+	}
+
+	_ = os.RemoveAll(filepath.Join("/var/lib/cni", sandboxID))
+
+	return nil
+}
+
+func (s *Service) resolveSandboxIP(ctx context.Context, sandboxID string) (string, error) {
 	deadline := time.Now().Add(12 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			return "", fmt.Errorf("resolve sandbox ip canceled: %w", ctx.Err())
+		default:
+		}
 		ip, err := network.LookupFCNetIPv4FromResultCache(sandboxID)
 		if err == nil {
 			return ip, nil
@@ -242,26 +325,57 @@ func (s *Service) applySandboxNetworkPolicy(sbx *model.Sandbox) error {
 	return network.ApplySandboxRules(s.ipt, sbx.ID, sbx.IP, s.cidr, s.bridgeIF, sbx.Egress, toPublishedPorts(sbx.Ports))
 }
 
+func (s *Service) applyHostPortPublish(sbx *model.Sandbox) error {
+	return network.ApplyHostPortDNAT(s.ipt, sbx.ID, sbx.IP, toHostPortForwards(sbx.Ports))
+}
+
+func (s *Service) cleanupHostPortPublish(sbx *model.Sandbox) {
+	if sbx.IP != "" {
+		network.DeleteHostPortDNAT(s.ipt, sbx.ID, sbx.IP, toHostPortForwards(sbx.Ports))
+	}
+
+	// Fallback cleanup by tagged rules handles partial-failure/orphan cases
+	// where state/port metadata is incomplete.
+	network.DeleteHostPortDNATBySandbox(s.ipt, sbx.ID)
+}
+
 func (s *Service) cleanupSandboxNetworkPolicy(sbx *model.Sandbox) {
 	if sbx.IP == "" {
 		return
 	}
 
-	pub, hostPorts := toHostPortRules(sbx.Ports)
-	network.DeleteSandboxRules(s.ipt, sbx.ID, sbx.IP, sbx.BridgeName, pub)
-	if len(hostPorts) > 0 {
-		network.DeleteHostPortDNAT(s.ipt, sbx.IP, pub, hostPorts)
-	}
+	network.DeleteSandboxRules(s.ipt, sbx.ID, sbx.IP, sbx.BridgeName, toPublishedPorts(sbx.Ports))
 }
 
 func (s *Service) refreshSandboxRuntimeState(ctx context.Context, sbx *model.Sandbox) {
+	if sbx.Phase == SandboxPhaseError && sbx.Error != "" {
+		// Preserve terminal provisioning errors captured in state.
+		sbx.UpdatedAt = time.Now().UTC()
+		return
+	}
+
+	if len(sbx.Containers) == 0 {
+		// Keep explicit lifecycle phase when container plan is absent.
+		// This prevents empty-state sandboxes from being misreported as running.
+		sbx.UpdatedAt = time.Now().UTC()
+		return
+	}
+
 	hasError := false
 	sandboxErr := ""
 	allRunning := true
+	inCreateGrace := sbx.Phase == SandboxPhaseCreating && time.Since(sbx.CreatedAt) < DefaultReadyTimeout
 
 	for name, st := range sbx.Containers {
 		next := s.fillContainerRuntimeState(ctx, st)
+		if inCreateGrace && next.TaskStatus == "not_found" {
+			next.Phase = ContainerPhaseCreating
+			next.Error = ""
+			next.TaskStatus = "creating"
+		}
+
 		sbx.Containers[name] = next
+
 		if next.Phase == "error" {
 			hasError = true
 			if sandboxErr == "" && next.Error != "" {
@@ -389,15 +503,17 @@ func toPublishedPorts(in []model.PortMapping) []network.PublishedPort {
 	return out
 }
 
-func toHostPortRules(in []model.PortMapping) ([]network.PublishedPort, []int) {
-	pub := make([]network.PublishedPort, 0, len(in))
-	hostPorts := make([]int, 0, len(in))
+func toHostPortForwards(in []model.PortMapping) []network.HostPortForward {
+	out := make([]network.HostPortForward, 0, len(in))
 	for _, p := range in {
-		pub = append(pub, network.PublishedPort{ContainerPort: p.ContainerPort, Protocol: p.Protocol})
-		hostPorts = append(hostPorts, p.HostPort)
+		out = append(out, network.HostPortForward{
+			HostPort:      p.HostPort,
+			ContainerPort: p.ContainerPort,
+			Protocol:      p.Protocol,
+		})
 	}
 
-	return pub, hostPorts
+	return out
 }
 
 func (s *Service) acquireSandboxLock(id string) (func(), error) {
@@ -407,13 +523,42 @@ func (s *Service) acquireSandboxLock(id string) (func(), error) {
 		return nil, err
 	}
 
-	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
-		_ = f.Close()
-		return nil, err
+	deadline := time.Now().Add(DefaultLockWaitTimeout)
+	for {
+		if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err == nil {
+			break
+		} else if err != unix.EWOULDBLOCK {
+			_ = f.Close()
+			return nil, err
+		}
+
+		if time.Now().After(deadline) {
+			_ = f.Close()
+			return nil, fmt.Errorf("lock timeout: %s", id)
+		}
+
+		time.Sleep(120 * time.Millisecond)
 	}
 
 	return func() {
 		_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
 		_ = f.Close()
 	}, nil
+}
+
+func (s *Service) isSandboxLockHeld(id string) bool {
+	lockPath := filepath.Join(s.lockDir, id+".lock")
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0o644)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		return err == unix.EWOULDBLOCK
+	}
+
+	_ = unix.Flock(int(f.Fd()), unix.LOCK_UN)
+
+	return false
 }
