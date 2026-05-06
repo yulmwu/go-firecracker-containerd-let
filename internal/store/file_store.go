@@ -22,16 +22,21 @@ func NewFileStore(baseDir string) (*FileStore, error) {
 }
 
 func (s *FileStore) Save(sb *model.Sandbox) error {
+	dir := filepath.Join(s.baseDir, sb.ID)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return err
+	}
+
 	b, err := json.MarshalIndent(sb, "", "  ")
 	if err != nil {
 		return err
 	}
 
-	return os.WriteFile(s.path(sb.ID), b, 0o644)
+	return os.WriteFile(filepath.Join(dir, "state.json"), b, 0o644)
 }
 
 func (s *FileStore) Load(id string) (*model.Sandbox, error) {
-	b, err := os.ReadFile(s.path(id))
+	b, err := os.ReadFile(filepath.Join(s.baseDir, id, "state.json"))
 	if err != nil {
 		return nil, err
 	}
@@ -45,7 +50,7 @@ func (s *FileStore) Load(id string) (*model.Sandbox, error) {
 }
 
 func (s *FileStore) Delete(id string) error {
-	err := os.Remove(s.path(id))
+	err := os.RemoveAll(filepath.Join(s.baseDir, id))
 	if errors.Is(err, os.ErrNotExist) {
 		return nil
 	}
@@ -61,20 +66,15 @@ func (s *FileStore) List() ([]*model.Sandbox, error) {
 
 	out := make([]*model.Sandbox, 0, len(entries))
 	for _, e := range entries {
-		if e.IsDir() || filepath.Ext(e.Name()) != ".json" {
+		if !e.IsDir() {
 			continue
 		}
 
-		id := e.Name()[:len(e.Name())-5]
-		sb, err := s.Load(id)
+		sb, err := s.Load(e.Name())
 		if err == nil {
 			out = append(out, sb)
 		}
 	}
 
 	return out, nil
-}
-
-func (s *FileStore) path(id string) string {
-	return filepath.Join(s.baseDir, id+".json")
 }

@@ -119,6 +119,8 @@ func ApplySandboxRules(ipt *iptables.IPTables, sandboxID, ip, bridgeCIDR, bridge
 
 	// Deny internal/reserved ranges to prevent lateral movement and host/local
 	// network reachability from sandbox workloads.
+	_ = ipt.AppendUnique("filter", fwd, "-m", "addrtype", "--dst-type", "LOCAL", "-j", "REJECT")
+
 	for _, cidr := range []string{
 		bridgeCIDR,
 		"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16",
@@ -171,6 +173,54 @@ func DeleteSandboxRules(ipt *iptables.IPTables, sandboxID, ip, bridgeIF string, 
 	_ = ipt.DeleteChain("filter", in)
 }
 
+// ApplyHostPortDNAT publishes host ports to a sandbox/container IP.
+func ApplyHostPortDNAT(ipt *iptables.IPTables, ip string, ports []PublishedPort, hostPorts []int) error {
+	for i, p := range ports {
+		if i >= len(hostPorts) {
+			break
+		}
+		proto := strings.ToLower(strings.TrimSpace(p.Protocol))
+		if proto == "" {
+			proto = "tcp"
+		}
+		hp := fmt.Sprintf("%d", hostPorts[i])
+		dst := fmt.Sprintf("%s:%d", ip, p.ContainerPort)
+
+		if err := ipt.AppendUnique("nat", "PREROUTING", "-p", proto, "--dport", hp, "-j", "DNAT", "--to-destination", dst); err != nil {
+			return err
+		}
+
+		if err := ipt.AppendUnique("nat", "OUTPUT", "-p", proto, "--dport", hp, "-j", "DNAT", "--to-destination", dst); err != nil {
+			return err
+		}
+
+		if err := ipt.AppendUnique("filter", "FORWARD", "-d", ip+"/32", "-p", proto, "--dport", fmt.Sprintf("%d", p.ContainerPort), "-j", "ACCEPT"); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+func DeleteHostPortDNAT(ipt *iptables.IPTables, ip string, ports []PublishedPort, hostPorts []int) {
+	for i, p := range ports {
+		if i >= len(hostPorts) {
+			break
+		}
+
+		proto := strings.ToLower(strings.TrimSpace(p.Protocol))
+		if proto == "" {
+			proto = "tcp"
+		}
+
+		hp := fmt.Sprintf("%d", hostPorts[i])
+		dst := fmt.Sprintf("%s:%d", ip, p.ContainerPort)
+		_ = ipt.Delete("nat", "PREROUTING", "-p", proto, "--dport", hp, "-j", "DNAT", "--to-destination", dst)
+		_ = ipt.Delete("nat", "OUTPUT", "-p", proto, "--dport", hp, "-j", "DNAT", "--to-destination", dst)
+		_ = ipt.Delete("filter", "FORWARD", "-d", ip+"/32", "-p", proto, "--dport", fmt.Sprintf("%d", p.ContainerPort), "-j", "ACCEPT")
+	}
+}
+
 // insertFirst keeps rule priority deterministic by re-inserting at position 1.
 // Deleting first prevents duplicates from repeated reconcile/create runs.
 func insertFirst(ipt *iptables.IPTables, parent string, rule []string) error {
@@ -187,6 +237,7 @@ func shortID(id string) string {
 	// between sandbox IDs that share the same prefix.
 	h := fnv.New32a()
 	_, _ = h.Write([]byte(id))
+
 	return fmt.Sprintf("%08x", h.Sum32())
 }
 
