@@ -42,6 +42,9 @@ func (s *Service) ReconcileOnce(ctx context.Context) error {
 
 	for _, sbx := range stateList {
 		if _, ok := runtimeSet[sbx.ID]; !ok {
+			sbx.Phase = SandboxPhaseError
+			sbx.Error = "missing runtime resources"
+			sbx.UpdatedAt = time.Now().UTC()
 			_ = s.store.Delete(sbx.ID)
 			continue
 		}

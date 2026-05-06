@@ -146,7 +146,7 @@ func (s *Service) createContainer(ctx context.Context, id, name, image string, a
 			return model.ContainerState{}, fmt.Errorf("start task %q: %w", id, err)
 		}
 
-		return model.ContainerState{ID: id, Name: name, Phase: "running", Image: ref, Args: args, Env: env, SnapshotKey: snap, TaskPID: task.Pid(), Runtime: "aws.firecracker", TaskStatus: "running"}, nil
+		return model.ContainerState{ID: id, Name: name, Phase: ContainerPhaseRunning, Image: ref, Args: args, Env: env, SnapshotKey: snap, TaskPID: task.Pid(), Runtime: "aws.firecracker", TaskStatus: "running"}, nil
 	}
 
 	if lastErr != nil {
@@ -275,16 +275,16 @@ func (s *Service) refreshSandboxRuntimeState(ctx context.Context, sbx *model.San
 	}
 
 	switch {
-	case sbx.Phase == "deleting":
+	case sbx.Phase == SandboxPhaseDeleting:
 		// keep explicit deleting state during delete flow
 	case hasError:
-		sbx.Phase = "error"
+		sbx.Phase = SandboxPhaseError
 		sbx.Error = sandboxErr
 	case allRunning:
-		sbx.Phase = "running"
+		sbx.Phase = SandboxPhaseRunning
 		sbx.Error = ""
 	default:
-		sbx.Phase = "creating"
+		sbx.Phase = SandboxPhaseCreating
 	}
 
 	sbx.UpdatedAt = time.Now().UTC()
@@ -294,7 +294,7 @@ func (s *Service) fillContainerRuntimeState(ctx context.Context, st model.Contai
 	ctr, err := s.client.LoadContainer(ctx, st.ID)
 	if err != nil {
 		st.TaskStatus = "not_found"
-		st.Phase = "error"
+		st.Phase = ContainerPhaseError
 		st.Error = "container not found"
 
 		return st
@@ -303,7 +303,7 @@ func (s *Service) fillContainerRuntimeState(ctx context.Context, st model.Contai
 	task, err := ctr.Task(ctx, nil)
 	if err != nil {
 		st.TaskStatus = "stopped"
-		st.Phase = "stopped"
+		st.Phase = ContainerPhaseStopped
 		st.Error = ""
 		return st
 	}
@@ -311,23 +311,14 @@ func (s *Service) fillContainerRuntimeState(ctx context.Context, st model.Contai
 	status, err := task.Status(ctx)
 	if err != nil {
 		st.TaskStatus = "unknown"
-		st.Phase = "error"
+		st.Phase = ContainerPhaseError
 		st.Error = "failed to read task status"
 		return st
 	}
 
 	st.TaskStatus = string(status.Status)
 	st.Error = ""
-	switch st.TaskStatus {
-	case "running":
-		st.Phase = "running"
-	case "created":
-		st.Phase = "creating"
-	case "stopped", "paused", "pausing":
-		st.Phase = "stopped"
-	default:
-		st.Phase = "unknown"
-	}
+	st.Phase = taskStatusToContainerPhase(st.TaskStatus)
 
 	st.ExitStatus = status.ExitStatus
 	if !status.ExitTime.IsZero() {
@@ -364,6 +355,19 @@ func normalizeImage(image string) string {
 	}
 
 	return "docker.io/library/" + image
+}
+
+func taskStatusToContainerPhase(taskStatus string) string {
+	switch taskStatus {
+	case "running":
+		return ContainerPhaseRunning
+	case "created":
+		return ContainerPhaseCreating
+	case "stopped", "paused", "pausing":
+		return ContainerPhaseStopped
+	default:
+		return ContainerPhaseUnknown
+	}
 }
 
 func sortedContainerNames(m map[string]model.ContainerState) []string {
