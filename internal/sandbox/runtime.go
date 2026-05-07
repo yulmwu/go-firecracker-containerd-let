@@ -113,86 +113,64 @@ func (s *Service) createContainer(ctx context.Context, id, name, image string, a
 		baseSpecOpts = append(baseSpecOpts, oci.WithProcessCwd(workDir))
 	}
 
-	var lastErr error
-	for _, snapshotter := range s.snapshotterCandidates() {
-		s.dbg("container create snapshotter id=%s snapshotter=%s", id, snapshotter)
-		img, err := s.client.GetImage(ctx, ref)
+	const snapshotter = "devmapper"
+	s.dbg("container create snapshotter id=%s snapshotter=%s", id, snapshotter)
+	img, err := s.client.GetImage(ctx, ref)
+	if err != nil {
+		img, err = s.client.Pull(ctx, ref, containerd.WithPullSnapshotter(snapshotter))
 		if err != nil {
-			img, err = s.client.Pull(ctx, ref, containerd.WithPullSnapshotter(snapshotter))
-			if err != nil {
-				if isSnapshotterErr(err) {
-					lastErr = err
-					continue
-				}
+			return model.ContainerState{}, fmt.Errorf("pull image %q: %w", ref, err)
+		}
+	}
 
-				return model.ContainerState{}, fmt.Errorf("pull image %q: %w", ref, err)
-			}
+	if err := img.Unpack(ctx, snapshotter); err != nil && !strings.Contains(strings.ToLower(err.Error()), "already exists") {
+		return model.ContainerState{}, fmt.Errorf("unpack image %q with snapshotter %q: %w", ref, snapshotter, err)
+	}
+
+	specOpts := append([]oci.SpecOpts{oci.WithImageConfig(img)}, baseSpecOpts...)
+	snap := id + "-snapshot"
+	for attempt := 1; attempt <= 4; attempt++ {
+		s.dbg("container create attempt id=%s snapshotter=%s attempt=%d", id, snapshotter, attempt)
+		_ = os.MkdirAll(filepath.Join("/run/firecracker-containerd/io.containerd.runtime.v2.task", s.namespace), 0o755)
+		ctr, err := s.client.NewContainer(ctx, id,
+			containerd.WithImage(img),
+			containerd.WithSnapshotter(snapshotter),
+			containerd.WithNewSnapshot(snap, img),
+			containerd.WithRuntime("aws.firecracker", nil),
+			containerd.WithNewSpec(specOpts...),
+		)
+
+		if err != nil {
+			return model.ContainerState{}, fmt.Errorf("new container %q: %w", id, err)
 		}
 
-		if err := img.Unpack(ctx, snapshotter); err != nil && !strings.Contains(strings.ToLower(err.Error()), "already exists") {
-			if isSnapshotterErr(err) {
-				lastErr = err
+		task, err := ctr.NewTask(ctx, cio.NewCreator(cio.WithStdio))
+		if err != nil {
+			_ = ctr.Delete(ctx)
+			if isTransientRuntimeErr(err) {
+				time.Sleep(time.Duration(120*attempt) * time.Millisecond)
 				continue
 			}
 
-			return model.ContainerState{}, fmt.Errorf("unpack image %q with snapshotter %q: %w", ref, snapshotter, err)
+			return model.ContainerState{}, fmt.Errorf("new task %q: %w", id, err)
 		}
 
-		specOpts := append([]oci.SpecOpts{oci.WithImageConfig(img)}, baseSpecOpts...)
-
-		snap := id + "-snapshot"
-		for attempt := 1; attempt <= 4; attempt++ {
-			s.dbg("container create attempt id=%s snapshotter=%s attempt=%d", id, snapshotter, attempt)
-			_ = os.MkdirAll(filepath.Join("/run/firecracker-containerd/io.containerd.runtime.v2.task", s.namespace), 0o755)
-			ctr, err := s.client.NewContainer(ctx, id,
-				containerd.WithImage(img),
-				containerd.WithSnapshotter(snapshotter),
-				containerd.WithNewSnapshot(snap, img),
-				containerd.WithRuntime("aws.firecracker", nil),
-				containerd.WithNewSpec(specOpts...),
-			)
-
-			if err != nil {
-				if isSnapshotterErr(err) {
-					lastErr = err
-					break
-				}
-
-				return model.ContainerState{}, fmt.Errorf("new container %q: %w", id, err)
+		if err := task.Start(ctx); err != nil {
+			_, _ = task.Delete(ctx, containerd.WithProcessKill)
+			_ = ctr.Delete(ctx)
+			if isTransientRuntimeErr(err) {
+				time.Sleep(time.Duration(120*attempt) * time.Millisecond)
+				continue
 			}
 
-			task, err := ctr.NewTask(ctx, cio.NewCreator(cio.WithStdio))
-			if err != nil {
-				_ = ctr.Delete(ctx)
-				if isTransientRuntimeErr(err) {
-					time.Sleep(time.Duration(120*attempt) * time.Millisecond)
-					continue
-				}
-
-				return model.ContainerState{}, fmt.Errorf("new task %q: %w", id, err)
-			}
-
-			if err := task.Start(ctx); err != nil {
-				_, _ = task.Delete(ctx, containerd.WithProcessKill)
-				_ = ctr.Delete(ctx)
-				if isTransientRuntimeErr(err) {
-					time.Sleep(time.Duration(120*attempt) * time.Millisecond)
-					continue
-				}
-
-				return model.ContainerState{}, fmt.Errorf("start task %q: %w", id, err)
-			}
-			s.dbg("container create success id=%s pid=%d", id, task.Pid())
-
-			return model.ContainerState{ID: id, Name: name, Phase: ContainerPhaseRunning, Image: ref, Args: args, Env: env, SnapshotKey: snap, TaskPID: task.Pid(), Runtime: "aws.firecracker", TaskStatus: "running"}, nil
+			return model.ContainerState{}, fmt.Errorf("start task %q: %w", id, err)
 		}
+
+		s.dbg("container create success id=%s pid=%d", id, task.Pid())
+		return model.ContainerState{ID: id, Name: name, Phase: ContainerPhaseRunning, Image: ref, Args: args, Env: env, SnapshotKey: snap, TaskPID: task.Pid(), Runtime: "aws.firecracker", TaskStatus: "running"}, nil
 	}
 
-	if lastErr != nil {
-		return model.ContainerState{}, fmt.Errorf("no usable snapshotter for %q: %w", ref, lastErr)
-	}
-
-	return model.ContainerState{}, fmt.Errorf("no usable snapshotter for %q", ref)
+	return model.ContainerState{}, fmt.Errorf("start task %q: exceeded retry attempts", id)
 }
 
 func isTransientRuntimeErr(err error) bool {
@@ -201,19 +179,6 @@ func isTransientRuntimeErr(err error) bool {
 		strings.Contains(msg, "cannot start a container that has stopped") ||
 		strings.Contains(msg, "failed to dial") ||
 		strings.Contains(msg, "connection refused")
-}
-
-func (s *Service) snapshotterCandidates() []string {
-	if v := strings.TrimSpace(os.Getenv("SANDBOX_SNAPSHOTTER")); v != "" {
-		return []string{v}
-	}
-
-	return []string{"devmapper", "overlayfs", "native"}
-}
-
-func isSnapshotterErr(err error) bool {
-	msg := strings.ToLower(err.Error())
-	return strings.Contains(msg, "snapshotter not loaded") || strings.Contains(msg, "invalid argument")
 }
 
 func (s *Service) stopAndDeleteContainer(ctx context.Context, id string) error {

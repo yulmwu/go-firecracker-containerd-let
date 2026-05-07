@@ -13,6 +13,40 @@ FC_CNI_CONF_FILE="${FC_CNI_CONF_DIR}/20-fcnet.conflist"
 
 log() { echo "[install] $*"; }
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing command: $1"; exit 1; }; }
+die() { echo "[install] ERROR: $*" >&2; exit 1; }
+
+backup_file() {
+  local f="$1"
+  [[ -f "$f" ]] || return 0
+  local ts
+  ts="$(date +%s)"
+  sudo cp -a "$f" "${f}.bak.${ts}"
+}
+
+isolate_system_containerd() {
+  # Never inject firecracker snapshotter config into system containerd used by Docker.
+  local bad="/etc/containerd/conf.d/99-firecracker-devmapper.toml"
+  if [[ -f "$bad" ]]; then
+    log "Moving conflicting system containerd snippet: $bad"
+    sudo mkdir -p /etc/containerd/conf.d.disabled
+    sudo mv "$bad" "/etc/containerd/conf.d.disabled/99-firecracker-devmapper.toml.bak"
+  fi
+}
+
+preflight_checks() {
+  need sudo
+  need systemctl
+  need awk
+  need sed
+
+  # Refuse to proceed if there are unknown firecracker snippets in system containerd conf.d.
+  local unknown
+  unknown="$(sudo find /etc/containerd/conf.d -maxdepth 1 -type f -name '*firecracker*' ! -name '99-firecracker-devmapper.toml' 2>/dev/null || true)"
+  if [[ -n "$unknown" ]]; then
+    echo "$unknown" >&2
+    die "unexpected firecracker snippets found in /etc/containerd/conf.d; clean up first"
+  fi
+}
 
 install_base() {
   need curl
@@ -28,13 +62,9 @@ install_base() {
     log "Installing containerd.io"
     sudo apt install -y containerd.io
   fi
-  if ! command -v docker >/dev/null 2>&1; then
-    log "docker CLI not found; install Docker first (required for Firecracker rootfs build)"
-    exit 1
-  fi
-
   log "Ensuring containerd service is running"
   sudo systemctl enable --now containerd
+  sudo systemctl is-active containerd >/dev/null || die "containerd failed to start"
 
   log "Installing CNI plugins ${CNI_VERSION}"
   sudo mkdir -p /opt/cni/bin
@@ -53,6 +83,14 @@ CONF
   sudo iptables -C FORWARD -j SANDBOX-FWD 2>/dev/null || sudo iptables -I FORWARD 1 -j SANDBOX-FWD
   sudo iptables -N SANDBOX-IN 2>/dev/null || true
   sudo iptables -C INPUT -j SANDBOX-IN 2>/dev/null || sudo iptables -I INPUT 1 -j SANDBOX-IN
+}
+
+ensure_firecracker_devpool() {
+  local pool="/dev/mapper/${FC_DM_POOL}"
+  if [[ ! -e "$pool" ]]; then
+    echo "firecracker devmapper pool is not ready: $pool" >&2
+    exit 1
+  fi
 }
 
 install_firecracker() {
@@ -147,7 +185,8 @@ JSON
 JSON
 
   log "Preparing devmapper thin-pool for firecracker snapshotter"
-  sudo FICD_DM_POOL="${FC_DM_POOL}" bash "${FC_SRC_DIR}/tools/thinpool.sh" create "${FC_DM_POOL}" || true
+  sudo FICD_DM_POOL="${FC_DM_POOL}" bash "${FC_SRC_DIR}/tools/thinpool.sh" create "${FC_DM_POOL}"
+  ensure_firecracker_devpool
 
   log "Writing /etc/firecracker-containerd/config.toml"
   sudo mkdir -p /etc/firecracker-containerd /var/lib/firecracker-containerd/containerd /run/firecracker-containerd
@@ -185,6 +224,7 @@ WantedBy=multi-user.target
 UNIT
   sudo systemctl daemon-reload
   sudo systemctl enable --now firecracker-containerd
+  sudo systemctl is-active firecracker-containerd >/dev/null || die "firecracker-containerd failed to start"
 }
 
 write_runtime_env() {
@@ -198,6 +238,7 @@ write_runtime_env() {
     else
       echo "SANDBOX_CONTAINERD_ADDRESS=${runtime_addr}" >> .env
     fi
+    sed -i '/^SANDBOX_SNAPSHOTTER=/d' .env
   else
     cat > .env <<ENV
 SANDBOX_CONTAINERD_ADDRESS=${runtime_addr}
@@ -206,6 +247,8 @@ ENV
 }
 
 main() {
+  preflight_checks
+  isolate_system_containerd
   install_base
   install_firecracker
   write_runtime_env
