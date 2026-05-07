@@ -59,12 +59,18 @@ install_base() {
   sudo apt install -y iproute2 iptables curl jq tar ca-certificates gnupg apparmor apparmor-utils git make gcc bc squashfs-tools debootstrap thin-provisioning-tools lvm2
 
   if ! command -v containerd >/dev/null 2>&1; then
-    log "Installing containerd.io"
-    sudo apt install -y containerd.io
+    install_containerd_pkg
   fi
+  if ! command -v docker >/dev/null 2>&1; then
+    install_docker_pkg
+  fi
+
   log "Ensuring containerd service is running"
   sudo systemctl enable --now containerd
   sudo systemctl is-active containerd >/dev/null || die "containerd failed to start"
+  log "Ensuring docker service is running"
+  sudo systemctl enable --now docker
+  sudo systemctl is-active docker >/dev/null || die "docker failed to start"
 
   log "Installing CNI plugins ${CNI_VERSION}"
   sudo mkdir -p /opt/cni/bin
@@ -85,12 +91,48 @@ CONF
   sudo iptables -C INPUT -j SANDBOX-IN 2>/dev/null || sudo iptables -I INPUT 1 -j SANDBOX-IN
 }
 
+install_containerd_pkg() {
+  log "Installing containerd package"
+  if sudo apt-cache show containerd.io >/dev/null 2>&1; then
+    sudo apt install -y containerd.io
+    return
+  fi
+
+  if sudo apt-cache show containerd >/dev/null 2>&1; then
+    sudo apt install -y containerd
+    return
+  fi
+
+  die "neither containerd.io nor containerd package is available in apt sources"
+}
+
+install_docker_pkg() {
+  log "Installing docker package"
+  if sudo apt-cache show docker.io >/dev/null 2>&1; then
+    sudo apt install -y docker.io
+    return
+  fi
+  if sudo apt-cache show docker-ce >/dev/null 2>&1; then
+    sudo apt install -y docker-ce docker-ce-cli containerd.io
+    return
+  fi
+  die "neither docker.io nor docker-ce package is available in apt sources"
+}
+
 ensure_firecracker_devpool() {
   local pool="/dev/mapper/${FC_DM_POOL}"
   if [[ ! -e "$pool" ]]; then
     echo "firecracker devmapper pool is not ready: $pool" >&2
     exit 1
   fi
+}
+
+install_rootfs_image() {
+  sudo mkdir -p "${FC_RUNTIME_DIR}"
+  command -v docker >/dev/null 2>&1 || die "docker is required to build firecracker rootfs image"
+  log "Building Firecracker VM rootfs image (docker)"
+  make -C "${FC_SRC_DIR}" image
+  sudo cp "${FC_SRC_DIR}/tools/image-builder/rootfs.img" "${FC_RUNTIME_DIR}/default-rootfs.img"
 }
 
 install_firecracker() {
@@ -115,10 +157,7 @@ install_firecracker() {
   log "Installing tc-redirect-tap CNI plugin"
   sudo env GOBIN=/opt/cni/bin go install github.com/awslabs/tc-redirect-tap/cmd/tc-redirect-tap@v0.0.0-20250516183331-34bf829e9a5c
 
-  log "Building Firecracker VM rootfs image"
-  make -C "${FC_SRC_DIR}" image
-  sudo mkdir -p "${FC_RUNTIME_DIR}"
-  sudo cp "${FC_SRC_DIR}/tools/image-builder/rootfs.img" "${FC_RUNTIME_DIR}/default-rootfs.img"
+  install_rootfs_image
 
   log "Downloading Firecracker kernel image"
   curl -fsSL -o /tmp/default-vmlinux.bin "${FC_KERNEL_URL}"
